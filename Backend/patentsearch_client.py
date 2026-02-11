@@ -61,9 +61,10 @@ def search_real_patents(
     idea: Dict[str, Any],
     *,
     limit: int = 100,
-    anchors: Optional[List[str]] = None,  # topic anchors
-    require_anchors: bool = True,         # keep junk out
-    require_keywords: bool = True,        # keep junk out (auto-disabled if keywords empty)
+    anchors: Optional[List[str]] = None,      # topic anchors
+    require_anchors: bool = True,             # keep junk out
+    require_keywords: bool = True,            # keep junk out (auto-disabled if keywords empty)
+    cpc_filters: Optional[List[str]] = None,  # CPC subclass filters e.g., ["G16H"]
     debug: bool = False,
 ) -> List[Dict[str, Any]]:
     api_key = os.getenv("PATENTSVIEW_API_KEY")
@@ -92,6 +93,17 @@ def search_real_patents(
     kw_terms = [_clean_term(k) for k in keywords[:10] if _clean_term(k)]
     if not kw_terms:
         require_keywords = False
+
+    # ✅ CPC filters normalize
+    cpc_filters_norm = _normalize_list(cpc_filters) if cpc_filters else []
+    cpc_filters_norm = [_clean_term(c) for c in cpc_filters_norm if _clean_term(c)]
+    cpc_filters_norm = cpc_filters_norm[:8]
+
+    if debug:
+        print("ANCHORS:", anchors)
+        print("KW_TERMS:", kw_terms)
+        print("EXCLUDES:", [_clean_term(k) for k in exclude_keywords[:12] if _clean_term(k)])
+        print("CPC_FILTERS:", cpc_filters_norm)
 
     criteria: List[Dict[str, Any]] = []
 
@@ -145,11 +157,16 @@ def search_real_patents(
     if assignee_filter:
         criteria.append({"_text_any": {"assignees.assignee_organization": assignee_filter}})
 
-    # Year range (CORRECT operator shape for this API)
+    # Year range
     if year_from and isinstance(year_from, int):
         criteria.append({"_gte": {"patent_date": f"{year_from}-01-01"}})
     if year_to and isinstance(year_to, int):
         criteria.append({"_lte": {"patent_date": f"{year_to}-12-31"}})
+
+    # ✅ CPC filter
+    # NOTE: We use an OR across subclasses: match ANY of the selected CPC subclasses
+    if cpc_filters_norm:
+        criteria.append({"_or": [{"_eq": {"cpc_current.cpc_subclass_id": c}} for c in cpc_filters_norm]})
 
     q = {"_and": criteria} if len(criteria) > 1 else criteria[0]
 
@@ -162,7 +179,6 @@ def search_real_patents(
         "cpc_current.cpc_subclass_id",
     ]
 
-    # Options for PatentSearch API (size/from)
     per_page = max(1, min(int(limit), 100))
     o = {"size": per_page, "from": 0}
 
@@ -170,9 +186,6 @@ def search_real_patents(
     params = {"q": json.dumps(q), "f": json.dumps(f), "o": json.dumps(o)}
 
     if debug:
-        print("ANCHORS:", anchors)
-        print("KW_TERMS:", kw_terms)
-        print("EXCLUDES:", not_terms)
         print("Q_LEN:", len(params["q"]))
 
     resp = None
@@ -180,7 +193,7 @@ def search_real_patents(
         resp = requests.get(PATENTSVIEW_BASE, headers=headers, params=params, timeout=30)
         resp.raise_for_status()
     except requests.HTTPError:
-        # Retry-on-5xx WITH safety rails (keep anchors + excludes)
+        # Retry-on-5xx WITH safety rails (keep anchors + excludes + CPC if present)
         if resp is not None and resp.status_code >= 500:
             minimal_criteria: List[Dict[str, Any]] = [
                 {
@@ -213,12 +226,12 @@ def search_real_patents(
                     }
                 )
 
-            minimal_q = (
-                {"_and": minimal_criteria}
-                if len(minimal_criteria) > 1
-                else minimal_criteria[0]
-            )
+            if cpc_filters_norm:
+                minimal_criteria.append(
+                    {"_or": [{"_eq": {"cpc_current.cpc_subclass_id": c}} for c in cpc_filters_norm[:6]]}
+                )
 
+            minimal_q = {"_and": minimal_criteria} if len(minimal_criteria) > 1 else minimal_criteria[0]
             params_retry = dict(params)
             params_retry["q"] = json.dumps(minimal_q)
 

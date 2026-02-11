@@ -172,6 +172,16 @@ except Exception as e:
 
 # ----------------- FastAPI app & CORS -----------------
 app = FastAPI(title="Student Patent Novelty Check - Backend")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -378,6 +388,8 @@ def search_patents(payload: SearchRequest):
                 anchors=anchors[:8],
                 require_anchors=True,
                 require_keywords=True,
+                cpc_filters=cpc_used,
+                debug=True,
             ) or []
 
             gating = "strict_anchors+keywords"
@@ -390,6 +402,8 @@ def search_patents(payload: SearchRequest):
                     anchors=anchors[:8],
                     require_anchors=True,
                     require_keywords=False,
+                    cpc_filters=cpc_used,
+                    debug=True,
                 ) or []
                 if len(raw2) > len(raw):
                     raw = raw2
@@ -403,6 +417,8 @@ def search_patents(payload: SearchRequest):
                     anchors=anchors[:8],
                     require_anchors=False,
                     require_keywords=False,
+                    cpc_filters=cpc_used,
+                    debug=True,
                 ) or []
                 if len(raw3) > len(raw):
                     raw = raw3
@@ -410,9 +426,8 @@ def search_patents(payload: SearchRequest):
 
             if not raw:
                 backend_mode = f"patentsview_live_no_results ({gating})"
-                results = []  # IMPORTANT: do NOT replace with mock
+                results = []  
             else:
-                # Rerank
                 docs: List[str] = []
                 for item in raw:
                     abs_text = item.get("_abstract") or ""
@@ -447,9 +462,7 @@ def search_patents(payload: SearchRequest):
             print("[search] Live search failed.")
             print("        Reason:", repr(e))
             backend_mode = "patentsview_live_error"
-            results = []  # return empty, not mock
-
-    # ----- MOCK ONLY when live is not available -----
+            results = []  
     if backend_mode.startswith("mock_"):
         results = [
             PatentResult(

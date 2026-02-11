@@ -1,6 +1,25 @@
-venv/
+# Python
 __pycache__/
-.env
-node_modules/
-*.sqlite
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
 search_logs.db
+
+# Virtual env
+venv/
+.env
+
+# Node
+node_modules/
+.next/
+
+# Environment files
+.env
+.env.local
+.env.development
+.env.production
+
+# OS
+.DS_Store
+Thumbs.db

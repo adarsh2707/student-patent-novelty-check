@@ -2,12 +2,25 @@
 
 import { useMemo, useState } from "react";
 
-const API_BASE = "http://127.0.0.1:8000";
+/**
+ * Backend base URL
+ * - Local default: http://127.0.0.1:8000
+ * - Override via frontend/.env.local: NEXT_PUBLIC_API_BASE_URL=https://your-render-url
+ */
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000").replace(
+  /\/$/,
+  ""
+);
 
 /* ----------------- helpers ----------------- */
 function pct(score) {
   const p = Math.round((score || 0) * 100);
   return Math.max(0, Math.min(100, p));
+}
+
+function apiUrl(path) {
+  const clean = (path || "").startsWith("/") ? path : `/${path}`;
+  return `${API_BASE}${clean}`;
 }
 
 function patentUrl(pub) {
@@ -18,19 +31,10 @@ function patentUrl(pub) {
 
 function confidenceLabel(p) {
   if (p >= 75)
-    return {
-      label: "High confidence",
-      tone: "bg-green-50 text-green-800 border-green-200",
-    };
+    return { label: "High confidence", tone: "bg-green-50 text-green-800 border-green-200" };
   if (p >= 55)
-    return {
-      label: "Medium confidence",
-      tone: "bg-amber-50 text-amber-800 border-amber-200",
-    };
-  return {
-    label: "Low confidence",
-    tone: "bg-slate-50 text-slate-700 border-slate-200",
-  };
+    return { label: "Medium confidence", tone: "bg-amber-50 text-amber-800 border-amber-200" };
+  return { label: "Low confidence", tone: "bg-slate-50 text-slate-700 border-slate-200" };
 }
 
 function modePill(mode) {
@@ -149,8 +153,7 @@ export default function HomePage() {
   const [technologies, setTechnologies] = useState([]);
   const [novelty, setNovelty] = useState("");
 
-  // richer inputs (frontend-only for now; backend can ignore safely)
-  const [keywords, setKeywords] = useState(""); // comma/line separated
+  const [keywords, setKeywords] = useState("");
   const [excludeKeywords, setExcludeKeywords] = useState("");
   const [assigneeFilter, setAssigneeFilter] = useState("");
   const [yearFrom, setYearFrom] = useState("");
@@ -170,10 +173,10 @@ export default function HomePage() {
   // Result controls
   const [sortBy, setSortBy] = useState("relevance"); // relevance | newest | oldest
   const [minSim, setMinSim] = useState(0); // 0-100
-  const [showAbstractPreview, setShowAbstractPreview] = useState(true); // UI toggle (works only if backend returns abstract/snippet)
+  const [showAbstractPreview, setShowAbstractPreview] = useState(true);
 
   // Feedback UI state
-  const [feedback, setFeedback] = useState({}); // key -> {vote, comment, submitted, status}
+  const [feedback, setFeedback] = useState({});
 
   const toggleInList = (value, list, setter) => {
     if (list.includes(value)) setter(list.filter((x) => x !== value));
@@ -207,6 +210,7 @@ export default function HomePage() {
       yearFrom ? `Year from: ${yearFrom}` : null,
       yearTo ? `Year to: ${yearTo}` : null,
       backendMode ? `Mode: ${backendMode}` : null,
+      `API_BASE: ${API_BASE}`,
     ]
       .filter(Boolean)
       .join("\n");
@@ -215,9 +219,7 @@ export default function HomePage() {
   const copySummary = async () => {
     try {
       await navigator.clipboard.writeText(makeSearchSummaryText());
-    } catch (e) {
-      // noop
-    }
+    } catch {}
   };
 
   const handleSubmit = async (e) => {
@@ -238,7 +240,6 @@ export default function HomePage() {
       technologies,
       novelty: novelty.trim() || undefined,
 
-      // extra fields (safe even if backend ignores)
       keywords: splitCsvOrLines(keywords),
       exclude_keywords: splitCsvOrLines(excludeKeywords),
       assignee_filter: assigneeFilter.trim() || undefined,
@@ -249,14 +250,14 @@ export default function HomePage() {
 
     try {
       // 1) parse-input -> CPC suggestions
-      const parseRes = await postJson(`${API_BASE}/parse-input`, idea);
+      const parseRes = await postJson(apiUrl("/parse-input"), idea);
       if (!parseRes.ok) throw new Error(`Parse input failed (${parseRes.status})`);
 
       const parseData = await parseRes.json();
       const cpc_suggestions = parseData.cpc_suggestions || [];
 
       // 2) search
-      const searchRes = await postJson(`${API_BASE}/search`, { idea, cpc_suggestions });
+      const searchRes = await postJson(apiUrl("/search"), { idea, cpc_suggestions });
       if (!searchRes.ok) {
         const txt = await searchRes.text();
         console.error("Search error body:", txt);
@@ -309,14 +310,13 @@ export default function HomePage() {
     const fb = feedback[key];
     if (!fb?.vote) return;
 
-    // optimistic UI
     setFeedback((prev) => ({
       ...prev,
       [key]: { ...prev[key], status: "Saving..." },
     }));
 
     try {
-      const res = await postJson(`${API_BASE}/feedback`, {
+      const res = await postJson(apiUrl("/feedback"), {
         idea_problem: problem.trim(),
         idea_domain: domain,
         cpc_used: cpcUsed,
@@ -332,14 +332,10 @@ export default function HomePage() {
         ...prev,
         [key]: { ...prev[key], submitted: true, status: "Saved ✅" },
       }));
-    } catch (e) {
+    } catch {
       setFeedback((prev) => ({
         ...prev,
-        [key]: {
-          ...prev[key],
-          submitted: true,
-          status: "Saved locally ✅ (backend not enabled)",
-        },
+        [key]: { ...prev[key], submitted: true, status: "Saved locally ✅ (backend not enabled)" },
       }));
     }
   };
@@ -359,6 +355,11 @@ export default function HomePage() {
               <p className="text-slate-600 max-w-3xl mt-2">
                 Provide more detail → better retrieval. Use keywords and filters to steer the search.
               </p>
+
+              <p className="text-xs text-slate-500 mt-2">
+                API:{" "}
+                <code className="px-1.5 py-0.5 rounded bg-slate-100 border">{API_BASE}</code>
+              </p>
             </div>
 
             {/* Tiny header status */}
@@ -375,7 +376,7 @@ export default function HomePage() {
               </span>
 
               <a
-                href={`${API_BASE}/health`}
+                href={apiUrl("/health")}
                 target="_blank"
                 rel="noreferrer"
                 className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-700 shadow-sm hover:bg-slate-50"
@@ -391,15 +392,12 @@ export default function HomePage() {
       <div className="mx-auto max-w-6xl px-6 py-10 grid grid-cols-1 lg:grid-cols-5 gap-8">
         {/* Left: Form */}
         <section className="lg:col-span-2 space-y-4">
-          {/* Search summary card (appears after a search) */}
           {(inputSummary || results.length > 0 || backendMode) && (
             <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
               <div className="p-5 border-b border-slate-100 flex items-start justify-between gap-3">
                 <div>
                   <p className="text-sm font-semibold text-slate-900">Search summary</p>
-                  <p className="text-xs text-slate-500 mt-1">
-                    Copy this into your notes or for debugging.
-                  </p>
+                  <p className="text-xs text-slate-500 mt-1">Copy this into your notes or for debugging.</p>
                 </div>
                 <button
                   type="button"
@@ -415,16 +413,11 @@ export default function HomePage() {
                 <SummaryLine label="Novelty" value={truncateText(novelty, 120) || ""} />
                 <SummaryLine label="Technologies" value={(technologies || []).join(", ")} />
                 <SummaryLine label="Keywords" value={splitCsvOrLines(keywords).slice(0, 12).join(", ")} />
-                <SummaryLine
-                  label="Exclude"
-                  value={splitCsvOrLines(excludeKeywords).slice(0, 12).join(", ")}
-                />
+                <SummaryLine label="Exclude" value={splitCsvOrLines(excludeKeywords).slice(0, 12).join(", ")} />
                 <SummaryLine label="Assignee" value={assigneeFilter.trim()} />
                 <SummaryLine
                   label="Years"
-                  value={
-                    yearFrom || yearTo ? `${yearFrom || "—"} → ${yearTo || "—"}` : ""
-                  }
+                  value={yearFrom || yearTo ? `${yearFrom || "—"} → ${yearTo || "—"}` : ""}
                 />
               </div>
             </div>
@@ -456,9 +449,7 @@ export default function HomePage() {
 
               {/* What it does */}
               <div>
-                <p className="block text-sm font-semibold text-slate-800 mb-2">
-                  What does your idea do?
-                </p>
+                <p className="block text-sm font-semibold text-slate-800 mb-2">What does your idea do?</p>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   {["Automates process", "Analyzes data", "Reduces time", "Improves UX", "Hardware control"].map(
                     (label) => (
@@ -475,9 +466,7 @@ export default function HomePage() {
 
               {/* Domain */}
               <div>
-                <label className="block text-sm font-semibold text-slate-800 mb-2">
-                  Primary domain
-                </label>
+                <label className="block text-sm font-semibold text-slate-800 mb-2">Primary domain</label>
                 <select
                   className="w-full rounded-xl border border-slate-200 bg-white px-3 py-3 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/40"
                   value={domain}
@@ -511,8 +500,7 @@ export default function HomePage() {
               {/* Novelty */}
               <div>
                 <label className="block text-sm font-semibold text-slate-800 mb-2">
-                  What’s novel about your idea?{" "}
-                  <span className="text-slate-400 font-medium">(optional)</span>
+                  What’s novel about your idea? <span className="text-slate-400 font-medium">(optional)</span>
                 </label>
                 <input
                   className="w-full rounded-xl border border-slate-200 bg-white px-3 py-3 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/40"
@@ -538,9 +526,7 @@ export default function HomePage() {
 
                 <div className="mt-3 space-y-3">
                   <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">
-                      Must-include keywords
-                    </label>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">Must-include keywords</label>
                     <textarea
                       className="w-full resize-none rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
                       rows={2}
@@ -551,9 +537,7 @@ export default function HomePage() {
                   </div>
 
                   <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">
-                      Exclude keywords
-                    </label>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">Exclude keywords</label>
                     <textarea
                       className="w-full resize-none rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
                       rows={2}
@@ -565,9 +549,7 @@ export default function HomePage() {
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
-                      <label className="block text-xs font-semibold text-slate-700 mb-1">
-                        Assignee (optional)
-                      </label>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Assignee (optional)</label>
                       <input
                         className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
                         value={assigneeFilter}
@@ -576,9 +558,7 @@ export default function HomePage() {
                       />
                     </div>
                     <div>
-                      <label className="block text-xs font-semibold text-slate-700 mb-1">
-                        Max results
-                      </label>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Max results</label>
                       <input
                         type="number"
                         min={3}
@@ -592,9 +572,7 @@ export default function HomePage() {
 
                   <div className="grid grid-cols-2 gap-3">
                     <div>
-                      <label className="block text-xs font-semibold text-slate-700 mb-1">
-                        Year from
-                      </label>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Year from</label>
                       <input
                         type="number"
                         className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
@@ -604,9 +582,7 @@ export default function HomePage() {
                       />
                     </div>
                     <div>
-                      <label className="block text-xs font-semibold text-slate-700 mb-1">
-                        Year to
-                      </label>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Year to</label>
                       <input
                         type="number"
                         className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
@@ -641,7 +617,7 @@ export default function HomePage() {
                       </button>
                     </label>
                     <p className="text-[11px] text-slate-500 mt-2">
-                      Note: This will only display if the backend returns <code>abstract</code> or{" "}
+                      Note: This will only display if the backend returns <code>abstract</code> /{" "}
                       <code>abstract_snippet</code> in results.
                     </p>
                   </div>
@@ -655,9 +631,7 @@ export default function HomePage() {
                   disabled={isLoading || !canSubmit}
                   className={[
                     "w-full rounded-xl px-4 py-3 text-sm font-semibold text-white transition shadow-sm",
-                    isLoading || !canSubmit
-                      ? "bg-slate-300 cursor-not-allowed"
-                      : "bg-blue-600 hover:bg-blue-700",
+                    isLoading || !canSubmit ? "bg-slate-300 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700",
                   ].join(" ")}
                 >
                   {isLoading ? "Searching patents…" : "Find Similar Patents"}
@@ -669,12 +643,7 @@ export default function HomePage() {
                     <div className="mt-1">{error}</div>
                     <div className="mt-2 text-xs text-red-700/90">
                       Try opening{" "}
-                      <a
-                        href={`${API_BASE}/health`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="underline"
-                      >
+                      <a href={apiUrl("/health")} target="_blank" rel="noreferrer" className="underline">
                         /health
                       </a>{" "}
                       to confirm the backend is running.
@@ -762,8 +731,7 @@ export default function HomePage() {
                   <ul className="mt-4 space-y-2 text-sm text-slate-700">
                     <li className="flex gap-2">
                       <span className="mt-1 h-2 w-2 rounded-full bg-slate-300 flex-shrink-0" />
-                      Add 3–6 <b>Must-include keywords</b> (specific nouns: “multispectral”, “NDVI”,
-                      “UAV”)
+                      Add 3–6 <b>Must-include keywords</b> (specific nouns: “multispectral”, “NDVI”, “UAV”)
                     </li>
                     <li className="flex gap-2">
                       <span className="mt-1 h-2 w-2 rounded-full bg-slate-300 flex-shrink-0" />
@@ -821,7 +789,6 @@ export default function HomePage() {
                       </div>
                     </div>
 
-                    {/* Hint if filter hides everything */}
                     {visibleResults.length === 0 && (
                       <div className="mt-3 text-sm text-slate-600">
                         Nothing meets <b>{minSim}%</b> similarity. Lower the slider to see more.
@@ -835,22 +802,20 @@ export default function HomePage() {
                       const p = pct(patent.similarity_score);
                       const url = patent.google_patents_url || patentUrl(patent.publication_number);
                       const conf = confidenceLabel(p);
-                      const fb = feedback[key] || {
-                        vote: null,
-                        comment: "",
-                        submitted: false,
-                        status: "",
-                      };
+                      const fb = feedback[key] || { vote: null, comment: "", submitted: false, status: "" };
 
-                      const abstract =
-                        (patent.abstract_snippet || patent.abstract || patent.patent_abstract || "").trim();
+                      const abstract = (
+                        patent.abstract_snippet ||
+                        patent.abstract ||
+                        patent.patent_abstract ||
+                        ""
+                      ).trim();
 
                       return (
                         <article
                           key={key}
                           className="relative rounded-2xl border border-slate-200 bg-white shadow-sm p-5 transition hover:shadow-md hover:-translate-y-[1px]"
                         >
-                          {/* Rank badge */}
                           <div className="absolute -top-3 -left-3">
                             <div className="rounded-2xl border border-slate-200 bg-white px-3 py-1 text-xs font-bold text-slate-700 shadow-sm">
                               #{idx + 1}
@@ -891,14 +856,11 @@ export default function HomePage() {
                                 </span>
                               </div>
 
-                              {/* Abstract preview (optional; only shows if backend provides it) */}
                               {showAbstractPreview && abstract && (
                                 <div className="mt-3">
                                   <button
                                     type="button"
-                                    onClick={() =>
-                                      setOpenAbstract((prev) => ({ ...prev, [key]: !prev[key] }))
-                                    }
+                                    onClick={() => setOpenAbstract((prev) => ({ ...prev, [key]: !prev[key] }))}
                                     className="text-sm font-semibold text-slate-800 hover:text-slate-900"
                                   >
                                     {openAbstract[key] ? "Hide" : "Show"} abstract preview
@@ -914,7 +876,6 @@ export default function HomePage() {
                                 </div>
                               )}
 
-                              {/* Abstract hint if toggle is on but no abstract provided */}
                               {showAbstractPreview && !abstract && (
                                 <p className="mt-3 text-xs text-slate-500">
                                   Abstract preview is enabled, but the backend isn’t returning{" "}
@@ -965,9 +926,7 @@ export default function HomePage() {
                             <div className="flex items-start justify-between gap-3">
                               <div>
                                 <p className="text-sm font-semibold text-slate-900">Feedback</p>
-                                <p className="text-xs text-slate-500 mt-1">
-                                  Helps us learn what “relevant” means for students.
-                                </p>
+                                <p className="text-xs text-slate-500 mt-1">Helps us learn what “relevant” means for students.</p>
                               </div>
                               {fb.status && <span className="text-xs text-slate-500">{fb.status}</span>}
                             </div>
@@ -1017,9 +976,7 @@ export default function HomePage() {
                                 disabled={!fb.vote || fb.submitted}
                                 className={[
                                   "rounded-xl px-4 py-2 text-sm font-semibold text-white transition",
-                                  !fb.vote || fb.submitted
-                                    ? "bg-slate-300 cursor-not-allowed"
-                                    : "bg-slate-900 hover:bg-slate-800",
+                                  !fb.vote || fb.submitted ? "bg-slate-300 cursor-not-allowed" : "bg-slate-900 hover:bg-slate-800",
                                 ].join(" ")}
                               >
                                 {fb.submitted ? "Saved" : "Submit feedback"}
@@ -1038,8 +995,7 @@ export default function HomePage() {
           </div>
 
           <p className="text-xs text-slate-500 mt-4">
-            Tip: If you’re getting “printer / messaging” type patents, add those words to{" "}
-            <b>Exclude keywords</b>.
+            Tip: If you’re getting “printer / messaging” type patents, add those words to <b>Exclude keywords</b>.
           </p>
         </section>
       </div>
