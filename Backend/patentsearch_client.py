@@ -1,15 +1,150 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-PATENTSVIEW_BASE = "https://search.patentsview.org/api/v1/patent/"
-HTTP_TIMEOUT = 6
+SERPAPI_BASE = "https://serpapi.com/search.json"
+HTTP_TIMEOUT = 12
+
+CPC_RULES = [
+    {
+        "label": "A61B",
+        "human": "Medical diagnosis, monitoring & sensing",
+        "full_codes": ["A61B5/00", "A61B5/024", "A61B5/1455"],
+        "terms": [
+            "heart", "ecg", "eeg", "diagnosis", "diagnostic", "monitoring",
+            "wearable", "patient", "vitals", "biosignal", "health",
+            "disease", "medical", "clinical", "symptom", "anomaly detection"
+        ],
+    },
+    {
+        "label": "A61M",
+        "human": "Devices for introducing media into the body",
+        "full_codes": ["A61M5/00", "A61M16/00"],
+        "terms": [
+            "infusion", "injection", "ventilation", "respirator", "catheter",
+            "drug delivery", "medical device", "pump", "therapy"
+        ],
+    },
+    {
+        "label": "G16H",
+        "human": "Digital health / healthcare informatics",
+        "full_codes": ["G16H10/60", "G16H50/20"],
+        "terms": [
+            "electronic health record", "ehr", "healthcare informatics",
+            "clinical decision", "patient management", "hospital workflow",
+            "medical record", "telemedicine", "digital health"
+        ],
+    },
+    {
+        "label": "G06N",
+        "human": "AI / machine learning",
+        "full_codes": ["G06N20/00", "G06N3/08", "G06N7/00"],
+        "terms": [
+            "ai", "ml", "machine learning", "deep learning", "neural network",
+            "reinforcement learning", "transformer", "classification",
+            "prediction", "predictive analytics", "computer vision",
+            "nlp", "artificial intelligence"
+        ],
+    },
+    {
+        "label": "G06F",
+        "human": "Computing / data processing",
+        "full_codes": ["G06F16/00", "G06F18/00", "G06F9/00"],
+        "terms": [
+            "data processing", "software", "workflow", "scheduler",
+            "database", "query", "server", "application", "computing",
+            "analytics", "dashboard", "automation", "platform"
+        ],
+    },
+    {
+        "label": "G06Q",
+        "human": "Business methods / commerce / operations",
+        "full_codes": ["G06Q10/06", "G06Q10/08", "G06Q50/00"],
+        "terms": [
+            "supply chain", "inventory", "warehouse", "procurement",
+            "business process", "forecasting", "planning", "operations",
+            "commerce", "payment", "retail", "order management"
+        ],
+    },
+    {
+        "label": "G01C",
+        "human": "Navigation / positioning / mapping",
+        "full_codes": ["G01C21/00", "G01C21/34"],
+        "terms": [
+            "navigation", "gps", "mapping", "positioning", "route",
+            "routing", "location", "geospatial", "trajectory"
+        ],
+    },
+    {
+        "label": "G08B",
+        "human": "Alarm / monitoring systems",
+        "full_codes": ["G08B21/00", "G08B25/10"],
+        "terms": [
+            "alarm", "alert", "warning", "incident detection",
+            "surveillance", "monitoring system", "event detection",
+            "notification"
+        ],
+    },
+    {
+        "label": "G09B",
+        "human": "Education / teaching aids",
+        "full_codes": ["G09B5/00", "G09B7/00"],
+        "terms": [
+            "student", "learning", "education", "teaching", "study",
+            "curriculum", "training", "assignment", "syllabus",
+            "learning assistant"
+        ],
+    },
+    {
+        "label": "B25J",
+        "human": "Industrial robots / manipulators",
+        "full_codes": ["B25J9/16", "B25J13/08"],
+        "terms": [
+            "robot", "robotic", "manipulator", "industrial robot",
+            "arm control", "actuator", "automation cell"
+        ],
+    },
+    {
+        "label": "B65G",
+        "human": "Conveying / warehouse handling",
+        "full_codes": ["B65G1/00", "B65G47/00"],
+        "terms": [
+            "conveyor", "warehouse handling", "sorting", "material handling",
+            "storage system", "picking", "packing", "fulfillment"
+        ],
+    },
+    {
+        "label": "A01B",
+        "human": "Agriculture / soil / field operations",
+        "full_codes": ["A01B79/00", "A01B69/00"],
+        "terms": [
+            "agriculture", "farm", "farmer", "crop", "soil", "field",
+            "harvest", "irrigation", "agronomy"
+        ],
+    },
+    {
+        "label": "A01C",
+        "human": "Planting / seeding / cultivation",
+        "full_codes": ["A01C21/00", "A01C23/00"],
+        "terms": [
+            "seed", "seeding", "planting", "cultivation", "sowing"
+        ],
+    },
+    {
+        "label": "A01G",
+        "human": "Crop health / plant care",
+        "full_codes": ["A01G7/00", "A01G25/00"],
+        "terms": [
+            "crop health", "plant disease", "pest", "leaf", "canopy",
+            "agricultural monitoring", "plant stress", "fertility"
+        ],
+    },
+]
 
 
 def _clean_term(t: str) -> str:
@@ -57,70 +192,27 @@ def _snippet(text: str, n: int = 360) -> str:
     return t[:n].strip() + "…"
 
 
-def _dedupe_preserve(xs: List[str]) -> List[str]:
-    seen = set()
-    out: List[str] = []
-    for x in xs:
-        if not x:
-            continue
-        k = x.strip().upper()
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(k)
-    return out
+def _extract_pub_from_patent_id(patent_id: str) -> str:
+    pid = (patent_id or "").strip()
+    if not pid:
+        return ""
+    m = re.search(r"patent/([^/]+)", pid, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip().upper()
+    return pid.strip().upper()
 
 
-def _compact_cpc(code: str) -> str:
-    return (code or "").strip().upper().replace(" ", "")
-
-
-def _extract_cpc_list(patent_obj: Dict[str, Any]) -> List[str]:
-    cpcs: List[str] = []
-    cpc_current = patent_obj.get("cpc_current") or []
-    if isinstance(cpc_current, list):
-        for c in cpc_current:
-            if isinstance(c, dict):
-                v = (c.get("cpc_subclass_id") or "").strip()
-                if v:
-                    cpcs.append(v.upper().replace(" ", ""))
-    return _dedupe_preserve(cpcs)
-
-
-def _extract_cpc_full_codes(patent_obj: Dict[str, Any]) -> List[str]:
-    subclass: List[str] = []
-    group: List[str] = []
-    subgroup: List[str] = []
-
-    cpc_current = patent_obj.get("cpc_current") or []
-    if isinstance(cpc_current, list):
-        for c in cpc_current:
-            if not isinstance(c, dict):
-                continue
-
-            sc = (c.get("cpc_subclass_id") or "").strip()
-            if sc:
-                subclass.append(sc)
-
-            g = (c.get("cpc_group_id") or "").strip()
-            if g:
-                group.append(g)
-
-            sg = (c.get("cpc_subgroup_id") or "").strip()
-            if sg:
-                subgroup.append(sg)
-
-    combined = subgroup + group + subclass
-    return _dedupe_preserve([x.replace(" ", "") for x in combined])
-
-
-def _build_text_any_clauses(field: str, phrases: List[str]) -> List[Dict[str, Any]]:
-    clauses = []
-    for p in phrases:
-        cleaned = _clean_term(p)
-        if cleaned:
-            clauses.append({"_text_any": {field: cleaned}})
-    return clauses
+def _extract_year(value: Any) -> int:
+    if not value:
+        return datetime.utcnow().year
+    s = str(value).strip()
+    m = re.match(r"(\d{4})", s)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    return datetime.utcnow().year
 
 
 def _keyword_presence_score(text: str, keywords: List[str], excludes: List[str]) -> float:
@@ -156,7 +248,17 @@ def _build_query_variants(
         _shorten(" ".join([problem] + keywords[:4]), 140),
         _shorten(" ".join(anchors[:5]), 120),
     ]
-    return [v for v in _dedupe_preserve([v for v in variants if v]) if v]
+
+    seen = set()
+    out: List[str] = []
+    for v in variants:
+        if not v:
+            continue
+        key = v.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(v)
+    return out
 
 
 def _merge_unique_patents(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -180,161 +282,168 @@ def _merge_unique_patents(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(best.values())
 
 
-def _search_once(
+def _infer_cpc_from_text(text: str, idea: Dict[str, Any]) -> Dict[str, Any]:
+    blob = f"{text} {' '.join(idea.get('technologies') or [])} {idea.get('domain') or ''} {idea.get('novelty') or ''}"
+    blob = _clean_term(blob).lower()
+
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for rule in CPC_RULES:
+        score = 0.0
+        for term in rule["terms"]:
+            term_clean = _clean_term(term).lower()
+            if term_clean and term_clean in blob:
+                score += 1.0
+                if len(term_clean.split()) > 1:
+                    score += 0.25
+        if score > 0:
+            scored.append((score, rule))
+
+    if not scored:
+        domain = (idea.get("domain") or "").strip().lower()
+        if domain == "medtech":
+            return {
+                "cpc_label": "A61B",
+                "cpc_codes": ["A61B"],
+                "cpc_full_codes": ["A61B5/00"],
+                "cpc_human": "Medical diagnosis, monitoring & sensing",
+                "cpc_confidence": 0.58,
+                "cpc_alternatives": ["A61B"],
+            }
+        if domain == "robotics":
+            return {
+                "cpc_label": "B25J",
+                "cpc_codes": ["B25J"],
+                "cpc_full_codes": ["B25J9/16"],
+                "cpc_human": "Industrial robots / manipulators",
+                "cpc_confidence": 0.58,
+                "cpc_alternatives": ["B25J"],
+            }
+        if domain == "agriculture":
+            return {
+                "cpc_label": "A01G",
+                "cpc_codes": ["A01G"],
+                "cpc_full_codes": ["A01G7/00"],
+                "cpc_human": "Crop health / plant care",
+                "cpc_confidence": 0.58,
+                "cpc_alternatives": ["A01G"],
+            }
+        return {
+            "cpc_label": "G06F",
+            "cpc_codes": ["G06F"],
+            "cpc_full_codes": ["G06F16/00"],
+            "cpc_human": "Computing / data processing",
+            "cpc_confidence": 0.52,
+            "cpc_alternatives": ["G06F"],
+        }
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_rule = scored[0]
+
+    top_scores = [x[0] for x in scored[:3]]
+    max_score = max(best_score, 1.0)
+    confidence = min(0.95, 0.55 + min(0.40, best_score / (max_score + 2.0)))
+
+    alternatives = [rule["label"] for _, rule in scored[:3]]
+
+    return {
+        "cpc_label": best_rule["label"],
+        "cpc_codes": [best_rule["label"]],
+        "cpc_full_codes": best_rule["full_codes"][:3],
+        "cpc_human": best_rule["human"],
+        "cpc_confidence": round(confidence, 4),
+        "cpc_alternatives": alternatives,
+    }
+
+
+def _serpapi_search(
     *,
     api_key: str,
     query_text: str,
+    limit: int,
+    sort: Optional[str] = None,
+    debug: bool = False,
+) -> List[Dict[str, Any]]:
+    params = {
+        "engine": "google_patents",
+        "q": query_text,
+        "api_key": api_key,
+    }
+
+    if sort in {"new", "old"}:
+        params["sort"] = sort
+
+    if debug:
+        print("[serpapi search params]", params)
+
+    resp = requests.get(SERPAPI_BASE, params=params, timeout=HTTP_TIMEOUT)
+
+    if not resp.ok:
+        print("[SerpApi status]", resp.status_code)
+        print("[SerpApi body]", resp.text[:2000])
+
+    resp.raise_for_status()
+    data = resp.json()
+    organic = data.get("organic_results") or []
+
+    if debug:
+        print("[serpapi organic count]", len(organic) if isinstance(organic, list) else 0)
+
+    if not isinstance(organic, list):
+        return []
+
+    return organic[: max(1, min(limit, 20))]
+
+
+def _map_serpapi_result(
+    item: Dict[str, Any],
+    *,
     anchors: List[str],
     kw_terms: List[str],
     not_terms: List[str],
-    assignee_filter: str,
-    year_from: Optional[int],
-    year_to: Optional[int],
-    cpc_filters_norm: List[str],
-    limit: int,
-    require_anchors: bool,
-    require_keywords: bool,
-    debug: bool = False,
-) -> List[Dict[str, Any]]:
-    criteria: List[Dict[str, Any]] = []
+    idea: Dict[str, Any],
+) -> Dict[str, Any]:
+    title = item.get("title") or "Untitled patent"
+    snippet = item.get("snippet") or item.get("summary") or ""
+    publication_number = (
+        item.get("publication_number")
+        or _extract_pub_from_patent_id(item.get("patent_id") or "")
+        or ""
+    )
 
-    title_abs_query = []
-    if query_text:
-        title_abs_query.extend(_build_text_any_clauses("patent_title", [query_text]))
-        title_abs_query.extend(_build_text_any_clauses("patent_abstract", [query_text]))
-        if title_abs_query:
-            criteria.append({"_or": title_abs_query})
+    patent_id = item.get("patent_id") or (f"patent/{publication_number}" if publication_number else "")
+    assignee = item.get("assignee") or "Unknown"
 
-    if require_anchors and anchors:
-        anchor_clauses = []
-        anchor_clauses.extend(_build_text_any_clauses("patent_title", anchors[:6]))
-        anchor_clauses.extend(_build_text_any_clauses("patent_abstract", anchors[:6]))
-        if anchor_clauses:
-            criteria.append({"_or": anchor_clauses})
+    year = _extract_year(
+        item.get("grant_date")
+        or item.get("publication_date")
+        or item.get("filing_date")
+    )
 
-    if require_keywords and kw_terms:
-        kw_clauses = []
-        kw_clauses.extend(_build_text_any_clauses("patent_title", kw_terms[:8]))
-        kw_clauses.extend(_build_text_any_clauses("patent_abstract", kw_terms[:8]))
-        if kw_clauses:
-            criteria.append({"_or": kw_clauses})
+    text_blob = f"{title} {snippet}"
+    lexical_score = _keyword_presence_score(text_blob, kw_terms + anchors[:4], not_terms)
+    anchor_hits = sum(1 for a in anchors[:6] if a.lower() in text_blob.lower()) if anchors else 0
+    client_score = lexical_score + min(0.18, anchor_hits * 0.04)
 
-    if not_terms:
-        criteria.append(
-            {
-                "_not": {
-                    "_or": (
-                        [{"_text_any": {"patent_title": t}} for t in not_terms]
-                        + [{"_text_any": {"patent_abstract": t}} for t in not_terms]
-                    )
-                }
-            }
-        )
+    cpc_meta = _infer_cpc_from_text(text_blob, idea)
 
-    if assignee_filter:
-        criteria.append({"_text_any": {"assignees.assignee_organization": assignee_filter}})
-
-    if year_from and isinstance(year_from, int):
-        criteria.append({"_gte": {"patent_date": f"{year_from}-01-01"}})
-    if year_to and isinstance(year_to, int):
-        criteria.append({"_lte": {"patent_date": f"{year_to}-12-31"}})
-
-    # Retrieval hint only: use top4 subclass filters when provided
-    if cpc_filters_norm:
-        cpc_or = []
-        for c in cpc_filters_norm[:8]:
-            top4 = c[:4]
-            if top4:
-                cpc_or.append({"_eq": {"cpc_current.cpc_subclass_id": top4}})
-        if cpc_or:
-            criteria.append({"_or": cpc_or})
-
-    if not criteria:
-        q = {"_text_any": {"patent_abstract": "innovation"}}
-    elif len(criteria) == 1:
-        q = criteria[0]
-    else:
-        q = {"_and": criteria}
-
-    f = [
-        "patent_id",
-        "patent_title",
-        "patent_date",
-        "patent_abstract",
-        "assignees.assignee_organization",
-        "cpc_current.cpc_subclass_id",
-        "cpc_current.cpc_group_id",
-        "cpc_current.cpc_subgroup_id",
-    ]
-
-    per_page = max(1, min(int(limit), 100))
-    o = {"size": per_page, "from": 0}
-
-    headers = {"X-Api-Key": api_key, "Accept": "application/json"}
-    params = {"q": json.dumps(q), "f": json.dumps(f), "o": json.dumps(o)}
-
-    if debug:
-        print("[_search_once] query_text:", query_text)
-        print("[_search_once] Q_LEN:", len(params["q"]))
-
-    resp = requests.get(PATENTSVIEW_BASE, headers=headers, params=params, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
-
-    data = resp.json()
-    patents = data.get("patents") or []
-
-    results: List[Dict[str, Any]] = []
-    for p in patents:
-        title = p.get("patent_title") or "Untitled patent"
-        abstract = p.get("patent_abstract") or ""
-        patent_id = p.get("patent_id") or "UNKNOWN"
-        patent_date = p.get("patent_date") or ""
-
-        year = datetime.utcnow().year
-        if isinstance(patent_date, str) and len(patent_date) >= 4:
-            try:
-                year = int(patent_date[:4])
-            except Exception:
-                pass
-
-        assignee = "Unknown"
-        assignees = p.get("assignees") or []
-        if isinstance(assignees, list) and assignees:
-            org = assignees[0].get("assignee_organization") if isinstance(assignees[0], dict) else None
-            if org:
-                assignee = org
-
-        cpc_list = _extract_cpc_list(p)
-        cpc_full_codes = _extract_cpc_full_codes(p)
-
-        publication_number = f"US{patent_id}"
-        google_url = f"https://patents.google.com/patent/{publication_number}"
-        cpc_label = cpc_list[0] if cpc_list else "CPC (unspecified)"
-
-        text_blob = f"{title} {abstract}"
-        lexical_score = _keyword_presence_score(text_blob, kw_terms + anchors[:4], not_terms)
-        anchor_hits = sum(1 for a in anchors[:6] if a.lower() in text_blob.lower()) if anchors else 0
-        client_score = lexical_score + min(0.18, anchor_hits * 0.04)
-
-        results.append(
-            {
-                "title": title,
-                "publication_number": publication_number,
-                "year": year,
-                "assignee": assignee,
-                "similarity_score": 0.0,
-                "cpc_label": cpc_label,
-                "cpc_list": cpc_list,
-                "cpc_full_codes": cpc_full_codes,
-                "why_similar": [],
-                "_abstract": abstract,
-                "abstract_snippet": _snippet(abstract),
-                "google_patents_url": google_url,
-                "_client_score": client_score,
-            }
-        )
-
-    return results
+    return {
+        "title": title,
+        "publication_number": publication_number or patent_id,
+        "year": year,
+        "assignee": assignee,
+        "similarity_score": 0.0,
+        "cpc_label": cpc_meta["cpc_label"],
+        "cpc_list": cpc_meta["cpc_codes"],
+        "cpc_full_codes": cpc_meta["cpc_full_codes"],
+        "cpc_human": cpc_meta["cpc_human"],
+        "cpc_confidence": cpc_meta["cpc_confidence"],
+        "cpc_alternatives": cpc_meta["cpc_alternatives"],
+        "why_similar": [],
+        "_abstract": snippet,
+        "abstract_snippet": _snippet(snippet),
+        "google_patents_url": item.get("link") or (f"https://patents.google.com/{patent_id}" if patent_id else None),
+        "_client_score": client_score,
+    }
 
 
 def search_real_patents(
@@ -347,9 +456,12 @@ def search_real_patents(
     cpc_filters: Optional[List[str]] = None,
     debug: bool = False,
 ) -> List[Dict[str, Any]]:
-    api_key = os.getenv("PATENTSVIEW_API_KEY")
+    api_key = os.getenv("SERPAPI_KEY")
+    print("SERPAPI_KEY loaded:", bool(api_key))
+    print("Problem received:", idea.get("problem"))
+
     if not api_key:
-        raise RuntimeError("PATENTSVIEW_API_KEY not set in environment.")
+        raise RuntimeError("SERPAPI_KEY not set in environment.")
 
     problem = (idea.get("problem") or "").strip()
     novelty = (idea.get("novelty") or "").strip()
@@ -358,9 +470,6 @@ def search_real_patents(
 
     keywords = _normalize_list(idea.get("keywords"))
     exclude_keywords = _normalize_list(idea.get("exclude_keywords"))
-    assignee_filter = (idea.get("assignee_filter") or "").strip()
-    year_from = idea.get("year_from")
-    year_to = idea.get("year_to")
 
     anchors = anchors or []
     anchors = [_clean_term(a) for a in anchors if _clean_term(a)]
@@ -368,19 +477,6 @@ def search_real_patents(
 
     kw_terms = [_clean_term(k) for k in keywords[:10] if _clean_term(k)]
     not_terms = [_clean_term(k) for k in exclude_keywords[:12] if _clean_term(k)]
-
-    if not kw_terms:
-        require_keywords = False
-
-    cpc_filters_norm = _normalize_list(cpc_filters) if cpc_filters else []
-    cpc_filters_norm = [_compact_cpc(c) for c in cpc_filters_norm if _compact_cpc(c)]
-    cpc_filters_norm = _dedupe_preserve(cpc_filters_norm)[:8]
-
-    if debug:
-        print("ANCHORS:", anchors)
-        print("KW_TERMS:", kw_terms)
-        print("EXCLUDES:", not_terms)
-        print("CPC_FILTERS:", cpc_filters_norm)
 
     query_variants = _build_query_variants(
         problem=problem,
@@ -394,124 +490,47 @@ def search_real_patents(
         query_variants = ["innovation"]
 
     all_rows: List[Dict[str, Any]] = []
-    per_variant_limit = max(10, min(limit, 40))
+    per_variant_limit = max(5, min(limit, 10))
 
-    search_plans = [
-        {"name": "strict", "require_anchors": require_anchors, "require_keywords": require_keywords},
-        {"name": "anchors_only", "require_anchors": require_anchors, "require_keywords": False},
-        {"name": "keywords_only", "require_anchors": False, "require_keywords": require_keywords},
-        {"name": "broad", "require_anchors": False, "require_keywords": False},
-    ]
+    for idx, variant in enumerate(query_variants[:4]):
+        sort = None
+        if idx == 1:
+            sort = "new"
+        elif idx == 2:
+            sort = "old"
 
-    for variant in query_variants[:4]:
-        for plan in search_plans:
-            try:
-                rows = _search_once(
-                    api_key=api_key,
-                    query_text=variant,
+        try:
+            organic = _serpapi_search(
+                api_key=api_key,
+                query_text=variant,
+                limit=per_variant_limit,
+                sort=sort,
+                debug=debug,
+            )
+
+            mapped = [
+                _map_serpapi_result(
+                    item,
                     anchors=anchors,
                     kw_terms=kw_terms,
                     not_terms=not_terms,
-                    assignee_filter=assignee_filter,
-                    year_from=year_from,
-                    year_to=year_to,
-                    cpc_filters_norm=cpc_filters_norm,
-                    limit=per_variant_limit,
-                    require_anchors=plan["require_anchors"],
-                    require_keywords=plan["require_keywords"],
-                    debug=debug,
+                    idea=idea,
                 )
-                if debug:
-                    print(f"[search_real_patents] variant={variant!r} plan={plan['name']} rows={len(rows)}")
-                all_rows.extend(rows)
-            except Exception as e:
-                if debug:
-                    print(f"[search_real_patents] variant={variant!r} plan={plan['name']} failed: {e}")
+                for item in organic
+            ]
+
+            if debug:
+                print(f"[search_real_patents] variant={variant!r} rows={len(mapped)}")
+
+            all_rows.extend(mapped)
+        except Exception as e:
+            if debug:
+                print(f"[search_real_patents] variant={variant!r} failed: {e}")
 
     merged = _merge_unique_patents(all_rows)
-
-    # No hard CPC filtering here.
-    # main.py handles strict hierarchical CPC filtering consistently.
-
     merged.sort(key=lambda x: float(x.get("_client_score", 0.0) or 0.0), reverse=True)
 
     for r in merged:
         r.pop("_client_score", None)
 
     return merged[: max(1, min(limit, 100))]
-
-
-def _try_patentsview_detail_query(publication_number: str, fields: List[str]) -> Dict[str, Any]:
-    api_key = os.getenv("PATENTSVIEW_API_KEY")
-    if not api_key:
-        return {}
-
-    patent_id = re.sub(r"^US", "", (publication_number or "").strip(), flags=re.IGNORECASE)
-
-    q = {"_eq": {"patent_id": patent_id}}
-    o = {"size": 1, "from": 0}
-
-    headers = {"X-Api-Key": api_key, "Accept": "application/json"}
-    params = {"q": json.dumps(q), "f": json.dumps(fields), "o": json.dumps(o)}
-
-    try:
-        resp = requests.get(PATENTSVIEW_BASE, headers=headers, params=params, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        patents = data.get("patents") or []
-        if patents:
-            return patents[0]
-    except Exception as e:
-        print(f"[detail-query] failed for {publication_number}: {e}")
-
-    return {}
-
-
-def get_patent_details(publication_number: str) -> Dict[str, Any]:
-    pub = (publication_number or "").strip()
-    if not pub:
-        return {}
-
-    fields = [
-        "patent_id",
-        "patent_title",
-        "patent_abstract",
-        "patent_num_claims",
-        "patent_claims",
-        "patent_description",
-    ]
-
-    p = _try_patentsview_detail_query(pub, fields)
-
-    title = p.get("patent_title") or ""
-    abstract = p.get("patent_abstract") or ""
-
-    raw_claims = p.get("patent_claims") or ""
-    raw_description = p.get("patent_description") or ""
-
-    claims = ""
-    brief_summary = ""
-
-    if isinstance(raw_claims, str):
-        claims = raw_claims.strip()
-    elif isinstance(raw_claims, list):
-        claims = " ".join([str(x).strip() for x in raw_claims if str(x).strip()])
-
-    if isinstance(raw_description, str):
-        desc = raw_description.strip()
-        m = re.search(
-            r"(brief summary|summary of the invention)(.*?)(detailed description|description of the drawings|claims)",
-            desc,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if m:
-            brief_summary = re.sub(r"\s+", " ", m.group(2)).strip()
-        else:
-            brief_summary = desc[:1200].strip()
-
-    return {
-        "title": title,
-        "abstract": abstract,
-        "brief_summary": brief_summary,
-        "claims": claims,
-    }

@@ -1,47 +1,30 @@
 # Student Patent Novelty Check
 
-Student Patent Novelty Check is a web-based application that helps students, researchers, and early-stage innovators identify potentially relevant prior art by searching patent data, ranking similar patents, and surfacing supporting snippets from abstracts, summaries, and claims.
+A full-stack patent novelty support tool that allows users to describe an idea, search for similar patents, rank results semantically, and review why a patent is relevant.
 
-The system combines semantic ranking, keyword matching, CPC-based filtering, and section-level evidence extraction to make patent discovery more interpretable and student-friendly.
-
-## Key Features
-
-- Semantic patent search based on idea description
-- Keyword-assisted retrieval and reranking
-- CPC-based filtering and refinement
-- Abstract, summary, and claims evidence snippets
-- Relevance feedback collection
-- Downloadable results report
-- Privacy policy / disclaimer page
-- PatentsView attribution integrated into the UI
+## Features
+- User registration and login
+- User-specific search history
+- Async patent search using Redis + RQ worker
+- Semantic patent ranking
+- Downloadable search results
+- Backend authentication and user isolation
 
 ## Tech Stack
+- Frontend: Next.js
+- Backend: FastAPI
+- Queue: Redis + RQ
+- Database: SQLite
+- Patent retrieval: SerpAPI / Google Patents
 
-### Frontend
-- Next.js
-- React
+## Backend setup
+1. Create `.env` from `.env.example`
+2. Install Python dependencies
+3. Start Redis
+4. Start FastAPI
+5. Start worker
 
-### Backend
-- FastAPI
-- Python
-- PatentsView API
-- sentence-transformers for semantic ranking
-
-## Project Structure
-
-```text
-student-patent-novelty-check/
-├── Backend/
-│   ├── main.py
-│   ├── patentsearch_client.py
-│   ├── semantic_ranker.py
-│   ├── cpc_mapper.py
-│   ├── requirements.txt
-│   └── ...
-├── frontend/
-│   ├── package.json
-│   ├── src/
-│   └── ...
-├── .env.example
-├── .gitignore
-└── README.md
+## Frontend setup
+1. Create `.env.local` from `.env.example`
+2. Install dependencies
+3. Run the Next.js dev server

@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import Footer from "../components/Footer";
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
+const PINNED_HISTORY_KEY = "spnc_pinned_history_ids";
 
 /* ----------------- helpers ----------------- */
 function pct(score) {
@@ -61,9 +62,52 @@ function modePill(mode) {
   return { label: "MODE", tone: "border-slate-200 bg-slate-50 text-slate-700" };
 }
 
+function getCpcMatchMeta(score) {
+  const s = Number(score || 0);
+
+  if (s >= 0.88) {
+    return {
+      label: "Strong CPC match",
+      tone: "border-emerald-200 bg-emerald-50 text-emerald-800",
+    };
+  }
+
+  if (s >= 0.68) {
+    return {
+      label: "Related CPC match",
+      tone: "border-blue-200 bg-blue-50 text-blue-800",
+    };
+  }
+
+  if (s >= 0.42) {
+    return {
+      label: "Broad CPC match",
+      tone: "border-amber-200 bg-amber-50 text-amber-800",
+    };
+  }
+
+  return {
+    label: "Weak CPC match",
+    tone: "border-slate-200 bg-slate-50 text-slate-700",
+  };
+}
+
+function fmtPct01(score) {
+  const n = Number(score || 0);
+  if (!Number.isFinite(n)) return "0%";
+  return `${Math.round(n * 100)}%`;
+}
+
 function splitCsvOrLines(s) {
   return (s || "")
     .split(/[\n,]+/g)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function splitCommaList(s) {
+  return (s || "")
+    .split(",")
     .map((x) => x.trim())
     .filter(Boolean);
 }
@@ -75,13 +119,92 @@ function truncateText(s, n = 180) {
   return `${t.slice(0, n).trim()}…`;
 }
 
+function formatDateTime(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  return d.toLocaleString();
+}
+
+function readPinnedHistoryIds() {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(PINNED_HISTORY_KEY);
+    const parsed = JSON.parse(raw || "[]");
+    return Array.isArray(parsed) ? parsed.map((x) => Number(x)).filter(Number.isFinite) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePinnedHistoryIds(ids) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(PINNED_HISTORY_KEY, JSON.stringify(ids));
+  } catch {}
+}
+
 async function postJson(url, body) {
   const res = await fetch(url, {
     method: "POST",
+    credentials: "include",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   return res;
+}
+
+async function fetchJson(url) {
+  const res = await fetch(url, {
+    method: "GET",
+    credentials: "include",
+    headers: { Accept: "application/json" },
+  });
+  return res;
+}
+
+async function pollSearchJob(
+  jobId,
+  {
+    maxMs = 120000,
+    intervalMs = 1200,
+    onUpdate = () => {},
+  } = {}
+) {
+  const started = Date.now();
+
+  while (Date.now() - started < maxMs) {
+    const statusRes = await fetchJson(apiUrl(`/search/jobs/${jobId}`));
+
+    if (!statusRes.ok) {
+      const txt = await statusRes.text();
+      throw new Error(`Failed to read job status: ${txt || statusRes.status}`);
+    }
+
+    const statusData = await statusRes.json();
+
+    onUpdate(statusData);
+
+    if (statusData.status === "completed") {
+      const resultRes = await fetchJson(apiUrl(`/search/jobs/${jobId}/result`));
+
+      if (!resultRes.ok) {
+        const txt = await resultRes.text();
+        throw new Error(`Failed to fetch job result: ${txt || resultRes.status}`);
+      }
+
+      const resultData = await resultRes.json();
+      return resultData.result;
+    }
+
+    if (statusData.status === "failed") {
+      throw new Error(statusData.error || "Search job failed");
+    }
+
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+
+  throw new Error("Search timed out. Please try again.");
 }
 
 function normalizePatent(patent) {
@@ -470,6 +593,10 @@ export default function HomePage() {
   const [domain, setDomain] = useState("Software");
   const [technologies, setTechnologies] = useState([]);
   const [novelty, setNovelty] = useState("");
+  const [jobId, setJobId] = useState(null);
+  const [jobStatus, setJobStatus] = useState(null);
+  const [jobProgress, setJobProgress] = useState(0);
+  const [jobStage, setJobStage] = useState("");
 
   const [keywords, setKeywords] = useState("");
   const [excludeKeywords, setExcludeKeywords] = useState("");
@@ -477,6 +604,13 @@ export default function HomePage() {
   const [yearFrom, setYearFrom] = useState("");
   const [yearTo, setYearTo] = useState("");
   const [maxResults, setMaxResults] = useState(10);
+
+  const [searchHistory, setSearchHistory] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const [selectedHistoryId, setSelectedHistoryId] = useState(null);
+  const [historyReplayMode, setHistoryReplayMode] = useState("edit");
+  const [pinnedHistoryIds, setPinnedHistoryIds] = useState([]);
 
   const [sectionKeywords, setSectionKeywords] = useState("");
   const [sectionScopes, setSectionScopes] = useState(["abstract", "claims"]);
@@ -514,6 +648,24 @@ export default function HomePage() {
   const [selSubclass, setSelSubclass] = useState("");
   const [selGroup, setSelGroup] = useState("");
   const [selSubgroup, setSelSubgroup] = useState("");
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [currentUser, setCurrentUser] = useState(null);
+
+  const [authMode, setAuthMode] = useState("login");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [authMessage, setAuthMessage] = useState("");
+
+  useEffect(() => {
+    setPinnedHistoryIds(readPinnedHistoryIds());
+  }, []);
+
+  useEffect(() => {
+    writePinnedHistoryIds(pinnedHistoryIds);
+  }, [pinnedHistoryIds]);
 
   useEffect(() => {
     const onKey = (e) => {
@@ -549,6 +701,16 @@ export default function HomePage() {
     });
     return sorted;
   }, [normalizedResults, sortBy, minSim]);
+
+  const sortedHistory = useMemo(() => {
+    const pinnedSet = new Set((pinnedHistoryIds || []).map(Number));
+    return [...searchHistory].sort((a, b) => {
+      const aPinned = pinnedSet.has(Number(a.id)) ? 1 : 0;
+      const bPinned = pinnedSet.has(Number(b.id)) ? 1 : 0;
+      if (aPinned !== bPinned) return bPinned - aPinned;
+      return Number(b.id || 0) - Number(a.id || 0);
+    });
+  }, [searchHistory, pinnedHistoryIds]);
 
   const scrollToForm = () => {
     if (!formRef.current) return;
@@ -801,6 +963,24 @@ export default function HomePage() {
     };
   };
 
+  const applySearchDataToState = (searchData, { markSearched = false } = {}) => {
+    setInputSummary(searchData.input_summary || "");
+    setCpcUsed(searchData.cpc_used || []);
+    setBackendMode(searchData.backend_mode || "");
+    setResults(searchData.results || []);
+    setCpcStats(searchData.cpc_stats || {});
+    setCpcHumanMap(searchData.cpc_human_map || {});
+
+    if (markSearched) {
+      setHasSearched(true);
+    }
+
+    if (searchData.results?.[0]) {
+      const k = `${searchData.results[0].publication_number}-0`;
+      setOpenWhy((prev) => ({ ...prev, [k]: true }));
+    }
+  };
+
   const resetCpcDropdown = () => {
     setSelSection("");
     setSelClass("");
@@ -809,126 +989,184 @@ export default function HomePage() {
     setSelSubgroup("");
   };
 
+  const applyHistoryDetailToInputs = (detail) => {
+    const nextProblem = detail?.problem_preview || "";
+    const nextDomain = detail?.domain || "Software";
+    const nextTechnologies = splitCommaList(detail?.technologies || "");
+    const nextNovelty = detail?.novelty_preview || "";
+
+    setProblem(nextProblem);
+    setStickyQuery(nextProblem);
+    setOverlayQuery(nextProblem);
+    setDomain(nextDomain || "Software");
+    setTechnologies(nextTechnologies);
+    setNovelty(nextNovelty);
+
+    return {
+      problem: nextProblem,
+      domain: nextDomain || "Software",
+      technologies: nextTechnologies,
+      novelty: nextNovelty,
+      what_it_does: whatItDoes,
+      keywords: splitCsvOrLines(keywords),
+      exclude_keywords: splitCsvOrLines(excludeKeywords),
+      assignee_filter: assigneeFilter.trim() || undefined,
+      year_from: yearFrom ? Number(yearFrom) : undefined,
+      year_to: yearTo ? Number(yearTo) : undefined,
+      max_results: Number(maxResults) || 10,
+      section_scopes: sectionScopes,
+      section_keywords: splitCsvOrLines(sectionKeywords),
+    };
+  };
+
+  const togglePinnedHistory = (historyId) => {
+    const idNum = Number(historyId);
+    setPinnedHistoryIds((prev) => {
+      const has = prev.includes(idNum);
+      return has ? prev.filter((x) => x !== idNum) : [idNum, ...prev];
+    });
+  };
+
   const runFullSearch = async (idea) => {
-    setIsLoading(true);
-    setError(null);
-    setResults([]);
-    setInputSummary("");
-    setCpcUsed([]);
-    setBackendMode("");
-    setOpenWhy({});
-    setOpenAbstract({});
-    setCpcStats({});
-    setCpcHumanMap({});
-    setOpenEvidence({});
-    resetCpcDropdown();
+	  setIsLoading(true);
+	  setError(null);
+	  setResults([]);
+	  setInputSummary("");
+	  setCpcUsed([]);
+	  setBackendMode("");
+	  setOpenWhy({});
+	  setOpenAbstract({});
+	  setCpcStats({});
+	  setCpcHumanMap({});
+	  setOpenEvidence({});
+	  resetCpcDropdown();
 
-    try {
-      const parseRes = await postJson(apiUrl("/parse-input"), idea);
-      if (!parseRes.ok) throw new Error(`Parse input failed (${parseRes.status})`);
-      const parseData = await parseRes.json();
-      const cpcSuggestions = parseData.cpc_suggestions || [];
+	  setJobId(null);
+	  setJobStatus("starting");
+	  setJobProgress(0);
+	  setJobStage("Preparing search...");
 
-      setLastIdea(idea);
-      setLastCpcSuggestions(cpcSuggestions);
+	  try {
+		const parseRes = await postJson(apiUrl("/parse-input"), idea);
+		if (!parseRes.ok) throw new Error(`Parse input failed (${parseRes.status})`);
 
-      const searchRes = await postJson(apiUrl("/search"), {
-        idea,
-        cpc_suggestions: cpcSuggestions,
-        cpc_filters: [],
-      });
+		const parseData = await parseRes.json();
+		const cpcSuggestions = parseData.cpc_suggestions || [];
 
-      if (!searchRes.ok) {
-        const txt = await searchRes.text();
-        console.error("Search error body:", txt);
-        throw new Error(`Search failed (${searchRes.status})`);
-      }
+		setLastIdea(idea);
+		setLastCpcSuggestions(cpcSuggestions);
 
-      const searchData = await searchRes.json();
-      setInputSummary(searchData.input_summary || "");
-      setCpcUsed(searchData.cpc_used || []);
-      setBackendMode(searchData.backend_mode || "");
-      setResults(searchData.results || []);
-      setCpcStats(searchData.cpc_stats || {});
-      setCpcHumanMap(searchData.cpc_human_map || {});
-      setHasSearched(true);
+		const jobRes = await postJson(apiUrl("/search/jobs"), {
+		  idea,
+		  cpc_suggestions: cpcSuggestions,
+		  cpc_filters: [],
+		});
 
-      if (searchData.results?.[0]) {
-        const k = `${searchData.results[0].publication_number}-0`;
-        setOpenWhy((prev) => ({ ...prev, [k]: true }));
-      }
-    } catch (err) {
-      console.error(err);
-      setError(err?.message || "Something went wrong talking to the backend.");
-    } finally {
-      setIsLoading(false);
-    }
+		if (!jobRes.ok) {
+		  const txt = await jobRes.text();
+		  throw new Error(`Search queue failed: ${txt}`);
+		}
+
+		const jobData = await jobRes.json();
+
+		setJobId(jobData.job_id);
+		setJobStatus(jobData.status || "queued");
+		setJobProgress(0);
+		setJobStage("Queued");
+
+		const searchData = await pollSearchJob(jobData.job_id, {
+		  onUpdate: (statusData) => {
+			setJobStatus(statusData.status || "");
+			setJobProgress(Number(statusData.progress || 0));
+			setJobStage(statusData.stage || "");
+		  },
+		});
+
+		applySearchDataToState(searchData, { markSearched: true });
+
+		setJobStatus("completed");
+		setJobProgress(100);
+		setJobStage("Completed");
+
+		if (currentUser) {
+		  await loadSearchHistory();
+		}
+	  } catch (err) {
+		console.error(err);
+		setError(err?.message || "Something went wrong talking to the backend.");
+		setJobStatus("failed");
+		setJobStage(err?.message || "Search failed");
+	  } finally {
+		setIsLoading(false);
+	  }
   };
 
   const runSearchWithCpcFilter = async (cpcFilter) => {
-    if (!lastIdea || isLoading) return;
+	  if (!lastIdea || isLoading) return;
 
-    const filter = normCpc(cpcFilter);
-    const filters = filter ? [filter] : [];
+	  const filter = normCpc(cpcFilter);
+	  const filters = filter ? [filter] : [];
 
-    setIsLoading(true);
-    setError(null);
-    setResults([]);
-    setOpenWhy({});
-    setOpenAbstract({});
-    setOpenEvidence({});
+	  setIsLoading(true);
+	  setError(null);
+	  setResults([]);
+	  setOpenWhy({});
+	  setOpenAbstract({});
+	  setOpenEvidence({});
 
-    try {
-      const searchRes = await postJson(apiUrl("/search"), {
-        idea: lastIdea,
-        cpc_suggestions: lastCpcSuggestions,
-        cpc_filters: filters,
-      });
+	  setJobId(null);
+	  setJobStatus("starting");
+	  setJobProgress(0);
+	  setJobStage("Preparing filtered search...");
 
-      if (!searchRes.ok) {
-        const txt = await searchRes.text();
-        console.error("Search error body:", txt);
-        throw new Error(`Search failed (${searchRes.status})`);
-      }
+	  try {
+		const jobRes = await postJson(apiUrl("/search/jobs"), {
+		  idea: lastIdea,
+		  cpc_suggestions: lastCpcSuggestions,
+		  cpc_filters: filters,
+		});
 
-      const searchData = await searchRes.json();
-      setInputSummary(searchData.input_summary || "");
-      setCpcUsed(searchData.cpc_used || []);
-      setBackendMode(searchData.backend_mode || "");
-      setResults(searchData.results || []);
-      setCpcStats(searchData.cpc_stats || {});
-      setCpcHumanMap(searchData.cpc_human_map || {});
+		if (!jobRes.ok) {
+		  const txt = await jobRes.text();
+		  throw new Error(`Search queue failed: ${txt}`);
+		}
 
-      if (searchData.results?.[0]) {
-        const k = `${searchData.results[0].publication_number}-0`;
-        setOpenWhy((prev) => ({ ...prev, [k]: true }));
-      }
-    } catch (err) {
-      console.error(err);
-      setError(err?.message || "Something went wrong talking to the backend.");
-    } finally {
-      setIsLoading(false);
-    }
-  };
+		const jobData = await jobRes.json();
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    const idea = buildIdeaFromState();
-    if (!idea.problem || idea.problem.length < 10) return;
-    setStickyQuery(idea.problem);
-    setOverlayQuery(idea.problem);
-    await runFullSearch(idea);
-  };
+		setJobId(jobData.job_id);
+		setJobStatus(jobData.status || "queued");
+		setJobProgress(0);
+		setJobStage("Queued");
 
-  const runSticky = async () => {
-    const q = (stickyQuery || "").trim();
-    if (q.length < 10) return;
-    setProblem(q);
-    const idea = buildIdeaFromState(q);
-    await runFullSearch(idea);
+		const searchData = await pollSearchJob(jobData.job_id, {
+		  onUpdate: (statusData) => {
+			setJobStatus(statusData.status || "");
+			setJobProgress(Number(statusData.progress || 0));
+			setJobStage(statusData.stage || "");
+		  },
+		});
+
+		applySearchDataToState(searchData);
+
+		setJobStatus("completed");
+		setJobProgress(100);
+		setJobStage("Completed");
+	  } catch (err) {
+		console.error(err);
+		setError(err?.message || "Something went wrong talking to the backend.");
+		setJobStatus("failed");
+		setJobStage(err?.message || "Filtered search failed");
+	  } finally {
+		setIsLoading(false);
+	  }
   };
 
   const runOverlay = async () => {
+    if (authRequired && !currentUser) {
+      setError("Please login before running a search.");
+      return;
+    }
+
     const q = (overlayQuery || "").trim();
     if (q.length < 10) return;
     setOverlayOpen(false);
@@ -936,6 +1174,36 @@ export default function HomePage() {
     setStickyQuery(q);
     const idea = buildIdeaFromState(q);
     await runFullSearch(idea);
+  };
+  const handleSubmit = async (e) => {
+	  e.preventDefault();
+
+	  if (!currentUser) {
+		setError("Please login before running a search.");
+		return;
+	  }
+
+	  const idea = buildIdeaFromState();
+	  if (!idea.problem || idea.problem.length < 10) return;
+
+	  setStickyQuery(idea.problem);
+	  setOverlayQuery(idea.problem);
+
+	  await runFullSearch(idea);
+  };
+  
+  const runSticky = async () => {
+	  if (authRequired && !currentUser) {
+		setError("Please login before running a search.");
+		return;
+	  }
+
+	  const q = (stickyQuery || "").trim();
+	  if (q.length < 10) return;
+
+	  setProblem(q);
+	  const idea = buildIdeaFromState(q);
+	  await runFullSearch(idea);
   };
 
   const useSuggestion = async (text, autoRun = true) => {
@@ -1081,6 +1349,245 @@ export default function HomePage() {
       if (has) return prev.filter((x) => x !== scope);
       return [...prev, scope];
     });
+  };
+
+  const loadAuthMe = async () => {
+    try {
+      const res = await fetchJson(apiUrl("/auth/me"));
+      if (!res.ok) {
+        throw new Error(`Auth check failed (${res.status})`);
+      }
+
+      const data = await res.json();
+      setAuthRequired(!!data.auth_required);
+      setCurrentUser(data.authenticated ? data.user : null);
+      setAuthError("");
+    } catch (err) {
+      console.error(err);
+      setAuthError("Could not verify authentication status.");
+    } finally {
+      setAuthChecked(true);
+    }
+  };
+
+  const loadSearchHistory = async () => {
+    if (!currentUser) {
+      setSearchHistory([]);
+      setHistoryError("");
+      return;
+    }
+
+    setHistoryLoading(true);
+    setHistoryError("");
+
+    try {
+      const res = await fetchJson(apiUrl("/history/searches"));
+
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(txt || `Failed to load history (${res.status})`);
+      }
+
+      const data = await res.json();
+      setSearchHistory(Array.isArray(data.items) ? data.items : []);
+    } catch (err) {
+      console.error(err);
+      setHistoryError(err?.message || "Could not load search history.");
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const handleHistoryClick = async (item) => {
+	  console.log("history clicked", item);
+	  setSelectedHistoryId(item.id);
+	  setHistoryError("");
+
+	  try {
+		const res = await fetchJson(apiUrl(`/history/searches/${item.id}`));
+		console.log("history detail response status", res.status);
+
+		if (!res.ok) {
+		  const txt = await res.text();
+		  throw new Error(txt || `Failed to load history detail (${res.status})`);
+		}
+
+		const data = await res.json();
+		console.log("history detail data", data);
+
+		if (historyReplayMode === "edit") {
+		  console.log("edit mode branch");
+		  setProblem(item.problem_preview || "");
+		  setStickyQuery(item.problem_preview || "");
+		  setOverlayQuery(item.problem_preview || "");
+		  if (item.domain) setDomain(item.domain);
+		  if (item.technologies) setTechnologies(splitCsvOrLines(item.technologies));
+		  if (item.novelty_preview) setNovelty(item.novelty_preview);
+		  applySearchDataToState(data.response || {}, { markSearched: true });
+		  scrollToForm();
+		  return;
+		}
+
+		if (historyReplayMode === "run") {
+		  console.log("run mode branch");
+		  const rerunIdea = {
+			problem: item.problem_preview || "",
+			what_it_does: whatItDoes,
+			domain: item.domain || domain,
+			technologies: item.technologies ? splitCsvOrLines(item.technologies) : [],
+			novelty: item.novelty_preview || undefined,
+			keywords: splitCsvOrLines(keywords),
+			exclude_keywords: splitCsvOrLines(excludeKeywords),
+			assignee_filter: assigneeFilter.trim() || undefined,
+			year_from: yearFrom ? Number(yearFrom) : undefined,
+			year_to: yearTo ? Number(yearTo) : undefined,
+			max_results: Number(maxResults) || 10,
+			section_scopes: sectionScopes,
+			section_keywords: splitCsvOrLines(sectionKeywords),
+		  };
+
+		  setProblem(rerunIdea.problem || "");
+		  setStickyQuery(rerunIdea.problem || "");
+		  setOverlayQuery(rerunIdea.problem || "");
+		  if (rerunIdea.domain) setDomain(rerunIdea.domain);
+		  setTechnologies(rerunIdea.technologies || []);
+		  setNovelty(rerunIdea.novelty || "");
+
+		  await runFullSearch(rerunIdea);
+		  return;
+		}
+
+		console.log("no replay branch matched", historyReplayMode);
+	  } catch (err) {
+		console.error(err);
+		setHistoryError(err?.message || "Could not open that past search.");
+	  }
+  };
+  
+  const handleDeleteHistory = async (itemId) => {
+	  try {
+		const res = await fetch(apiUrl(`/history/searches/${itemId}`), {
+		  method: "DELETE",
+		  credentials: "include",
+		});
+
+		if (!res.ok) {
+		  const txt = await res.text();
+		  throw new Error(txt || "Failed to delete history item");
+		}
+
+		setSearchHistory((prev) =>
+		  prev.filter((x) => Number(x.id) !== Number(itemId))
+		);
+
+		if (Number(selectedHistoryId) === Number(itemId)) {
+		  setSelectedHistoryId(null);
+		}
+
+	  } catch (err) {
+		console.error(err);
+		setHistoryError("Failed to delete history item");
+	  }
+  };
+
+  useEffect(() => {
+    if (currentUser) {
+      loadSearchHistory();
+    } else {
+      setSearchHistory([]);
+      setSelectedHistoryId(null);
+    }
+  }, [currentUser]);
+
+  useEffect(() => {
+    loadAuthMe();
+  }, []);
+
+  const handleRegister = async () => {
+    setAuthLoading(true);
+    setAuthError("");
+    setAuthMessage("");
+
+    try {
+      const res = await postJson(apiUrl("/auth/register"), {
+        email: authEmail.trim(),
+        password: authPassword,
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw new Error(data.detail || `Register failed (${res.status})`);
+      }
+
+      await loadAuthMe();
+      setAuthMessage("Account created and logged in.");
+      setAuthPassword("");
+    } catch (err) {
+      setAuthError(err?.message || "Registration failed.");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleLogin = async () => {
+    setAuthLoading(true);
+    setAuthError("");
+    setAuthMessage("");
+
+    try {
+      const res = await postJson(apiUrl("/auth/login"), {
+        email: authEmail.trim(),
+        password: authPassword,
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw new Error(data.detail || `Login failed (${res.status})`);
+      }
+
+      await loadAuthMe();
+      setAuthMessage("Logged in successfully.");
+      setAuthPassword("");
+    } catch (err) {
+      setAuthError(err?.message || "Login failed.");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    setAuthLoading(true);
+    setAuthError("");
+    setAuthMessage("");
+
+    try {
+      const res = await postJson(apiUrl("/auth/logout"), {});
+
+      if (!res.ok) {
+        throw new Error(`Logout failed (${res.status})`);
+      }
+
+      setCurrentUser(null);
+      setResults([]);
+      setInputSummary("");
+      setCpcUsed([]);
+      setBackendMode("");
+      setAuthMessage("Logged out.");
+      setSearchHistory([]);
+      setSelectedHistoryId(null);
+      setHasSearched(false);
+      setStickyQuery("");
+      setPinnedHistoryIds([]);
+      writePinnedHistoryIds([]);
+
+      await loadAuthMe();
+    } catch (err) {
+      setAuthError(err?.message || "Logout failed.");
+    } finally {
+      setAuthLoading(false);
+    }
   };
 
   return (
@@ -1237,8 +1744,294 @@ export default function HomePage() {
         </div>
       </div>
 
+      <div className="mx-auto max-w-6xl px-6 pt-6">
+        <div className={`${glassCard()} relative overflow-hidden`}>
+          <GlowLine />
+          <div className="p-5">
+            <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">Account</p>
+                <p className="text-xs text-slate-600 mt-1">
+                  {authChecked
+                    ? authRequired
+                      ? "Authentication is required for protected usage."
+                      : "Authentication is available and ready to be enforced."
+                    : "Checking authentication status..."}
+                </p>
+
+                {currentUser && (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Chip tone="brand">{currentUser.email}</Chip>
+                    <Chip tone="aqua">Role: {currentUser.role}</Chip>
+                    {currentUser.school_domain ? <Chip tone="default">{currentUser.school_domain}</Chip> : null}
+                  </div>
+                )}
+              </div>
+
+              {currentUser ? (
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleLogout}
+                    disabled={authLoading}
+                    className="rounded-2xl border border-white/30 bg-white/70 px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-white disabled:opacity-50"
+                  >
+                    {authLoading ? "Working..." : "Logout"}
+                  </button>
+                </div>
+              ) : (
+                <div className="w-full sm:w-[360px]">
+                  <div className="flex gap-2 mb-3">
+                    <button
+                      type="button"
+                      onClick={() => setAuthMode("login")}
+                      className={[
+                        "rounded-2xl px-3 py-2 text-sm font-semibold transition",
+                        authMode === "login"
+                          ? "bg-slate-900 text-white"
+                          : "border border-white/30 bg-white/70 text-slate-700 hover:bg-white",
+                      ].join(" ")}
+                    >
+                      Login
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setAuthMode("register")}
+                      className={[
+                        "rounded-2xl px-3 py-2 text-sm font-semibold transition",
+                        authMode === "register"
+                          ? "bg-slate-900 text-white"
+                          : "border border-white/30 bg-white/70 text-slate-700 hover:bg-white",
+                      ].join(" ")}
+                    >
+                      Register
+                    </button>
+                  </div>
+
+                  <div className="space-y-3">
+                    <input
+                      type="email"
+                      value={authEmail}
+                      onChange={(e) => setAuthEmail(e.target.value)}
+                      placeholder="Email"
+                      className="w-full rounded-2xl border border-white/40 bg-white/80 px-4 py-3 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-cyan-400/35"
+                    />
+
+                    <input
+                      type="password"
+                      value={authPassword}
+                      onChange={(e) => setAuthPassword(e.target.value)}
+                      placeholder="Password"
+                      className="w-full rounded-2xl border border-white/40 bg-white/80 px-4 py-3 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-fuchsia-400/35"
+                    />
+
+                    <button
+                      type="button"
+                      onClick={authMode === "login" ? handleLogin : handleRegister}
+                      disabled={authLoading || !authEmail.trim() || authPassword.length < 8}
+                      className={[
+                        "w-full rounded-2xl px-4 py-3 text-sm font-semibold text-white transition",
+                        authLoading || !authEmail.trim() || authPassword.length < 8
+                          ? "bg-slate-300/70 cursor-not-allowed"
+                          : "bg-gradient-to-r from-fuchsia-600 to-cyan-500 hover:from-fuchsia-500 hover:to-cyan-400",
+                      ].join(" ")}
+                    >
+                      {authLoading ? "Working..." : authMode === "login" ? "Login" : "Create account"}
+                    </button>
+
+                    {authError && (
+                      <div className="rounded-2xl border border-rose-200/60 bg-rose-50/70 px-4 py-3 text-sm text-rose-800">
+                        {authError}
+                      </div>
+                    )}
+
+                    {authMessage && (
+                      <div className="rounded-2xl border border-emerald-200/60 bg-emerald-50/70 px-4 py-3 text-sm text-emerald-800">
+                        {authMessage}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div className="mx-auto max-w-6xl px-6 py-10 grid grid-cols-1 lg:grid-cols-5 gap-8">
         <section className="lg:col-span-2 space-y-4" ref={formRef}>
+          {currentUser && (
+            <div className={`${glassCard()} relative overflow-hidden`}>
+              <GlowLine />
+              <div className="p-5 border-b border-white/20 flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">Past searches</p>
+                  <p className="text-xs text-slate-600 mt-1">
+                    Pin important ones and choose whether history should open for editing or rerun instantly.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={loadSearchHistory}
+                  disabled={historyLoading}
+                  className="rounded-2xl border border-white/30 bg-white/70 px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-white disabled:opacity-50"
+                >
+                  {historyLoading ? "Refreshing..." : "Refresh"}
+                </button>
+              </div>
+
+              <div className="p-5 space-y-4">
+                <div className="rounded-2xl border border-white/30 bg-white/60 p-3">
+                  <div className="text-xs font-semibold text-slate-700 mb-2">History click behavior</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setHistoryReplayMode("edit")}
+                      className={[
+                        "rounded-2xl px-3 py-2 text-sm font-semibold transition",
+                        historyReplayMode === "edit"
+                          ? "bg-slate-900 text-white"
+                          : "border border-white/30 bg-white/70 text-slate-700 hover:bg-white",
+                      ].join(" ")}
+                    >
+                      Edit before rerun
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setHistoryReplayMode("run")}
+                      className={[
+                        "rounded-2xl px-3 py-2 text-sm font-semibold transition",
+                        historyReplayMode === "run"
+                          ? "bg-slate-900 text-white"
+                          : "border border-white/30 bg-white/70 text-slate-700 hover:bg-white",
+                      ].join(" ")}
+                    >
+                      Run instantly
+                    </button>
+                  </div>
+
+                  <div className="mt-2 text-[11px] text-slate-600">
+                    {historyReplayMode === "edit"
+                      ? "Clicking a past search fills the form and restores saved results so you can edit before running again."
+                      : "Clicking a past search restores the form and immediately reruns the search."}
+                  </div>
+                </div>
+
+                {historyError && (
+                  <div className="rounded-2xl border border-rose-200/60 bg-rose-50/70 px-4 py-3 text-sm text-rose-800">
+                    {historyError}
+                  </div>
+                )}
+
+                {!historyLoading && sortedHistory.length === 0 && !historyError && (
+                  <div className="rounded-2xl border border-white/30 bg-white/60 px-4 py-4 text-sm text-slate-600">
+                    No saved searches yet. Run a search while logged in and it will appear here.
+                  </div>
+                )}
+
+                <div className="max-h-[520px] overflow-y-auto pr-1 space-y-3">
+                  {sortedHistory.map((item) => {
+                    const isActive = selectedHistoryId === item.id;
+                    const isPinned = pinnedHistoryIds.includes(Number(item.id));
+
+					return (
+					  <div
+						key={item.id}
+						onClick={() => handleHistoryClick(item)}
+						role="button"
+						tabIndex={0}
+						onKeyDown={(e) => {
+						  if (e.key === "Enter" || e.key === " ") {
+							e.preventDefault();
+							handleHistoryClick(item);
+						  }
+						}}
+                        className={[
+                          "w-full rounded-2xl border px-4 py-4 text-left transition",
+                          isActive
+                            ? "border-fuchsia-200 bg-fuchsia-50/70"
+                            : "border-white/30 bg-white/60 hover:bg-white/80",
+                        ].join(" ")}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <div className="text-sm font-semibold text-slate-900">
+                                {item.problem_preview || "Untitled search"}
+                              </div>
+                              {isPinned ? <Chip tone="brand">Pinned</Chip> : null}
+                            </div>
+
+                            <div className="mt-1 text-xs text-slate-600">{formatDateTime(item.created_at)}</div>
+
+                            <div className="mt-2 flex flex-wrap gap-2">
+                              {item.domain ? <Chip tone="aqua">{item.domain}</Chip> : null}
+                              {item.result_count != null ? <Chip tone="default">{item.result_count} results</Chip> : null}
+                              {item.backend_mode ? <Chip tone="brand">{item.backend_mode}</Chip> : null}
+                            </div>
+
+                            {item.technologies ? (
+                              <div className="mt-2 text-xs text-slate-600">
+                                Technologies: {truncateText(item.technologies, 80)}
+                              </div>
+                            ) : null}
+
+                            {item.novelty_preview ? (
+                              <div className="mt-1 text-xs text-slate-600">
+                                Novelty: {truncateText(item.novelty_preview, 90)}
+                              </div>
+                            ) : null}
+
+                            <div className="mt-2 text-[11px] text-slate-500">
+                              Click to {historyReplayMode === "run" ? "rerun instantly" : "restore & edit"}
+                            </div>
+                          </div>
+
+						<div className="flex flex-col items-end gap-2 flex-shrink-0">
+						  <div className="text-xs font-semibold text-slate-500">#{item.id}</div>
+
+						  <button
+							type="button"
+							onClick={(e) => {
+							  e.stopPropagation();
+							  togglePinnedHistory(item.id);
+							}}
+							className={[
+							  "rounded-full border px-2.5 py-1 text-[11px] font-semibold transition",
+							  isPinned
+								? "border-amber-200 bg-amber-50 text-amber-800"
+								: "border-white/30 bg-white/70 text-slate-700 hover:bg-white",
+							].join(" ")}
+							title={isPinned ? "Unpin search" : "Pin search"}
+						  >
+							{isPinned ? "★ Pinned" : "☆ Pin"}
+						  </button>
+
+						  <button
+							type="button"
+							onClick={(e) => {
+							  e.stopPropagation();
+							  if (confirm("Delete this search?")) {
+								handleDeleteHistory(item.id);
+							  }
+							}}
+							className="rounded-md border border-rose-300 bg-rose-50 px-2 py-1 text-[11px] font-semibold text-rose-700 hover:bg-rose-100"
+						  >
+							Delete
+						  </button>
+						 </div>
+					   </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+
           {(inputSummary || results.length > 0 || backendMode) && (
             <div className={`${glassCard()} relative overflow-hidden`}>
               <GlowLine />
@@ -1647,20 +2440,37 @@ export default function HomePage() {
                 }
               />
 
-              {isLoading && (
-                <div className="mt-4 rounded-3xl border border-white/25 bg-white/35 p-4 overflow-hidden relative">
-                  <div className="absolute inset-0 animate-pulse bg-gradient-to-r from-fuchsia-500/10 via-cyan-400/10 to-lime-400/10" />
-                  <div className="relative">
-                    <div className="text-sm font-semibold text-slate-900">Searching PatentsView…</div>
-                    <div className="text-xs text-slate-700 mt-1">
-                      Ranking results by semantic similarity and applying anchor/keyword gates.
-                    </div>
-                    <div className="mt-3 h-2 w-full rounded-full bg-white/60 overflow-hidden">
-                      <div className="h-full w-1/3 rounded-full bg-gradient-to-r from-fuchsia-600 to-cyan-500 animate-[pulse_1.1s_ease-in-out_infinite]" />
-                    </div>
-                  </div>
-                </div>
-              )}
+			  {isLoading && (
+				  <div className="mt-4 rounded-3xl border border-white/25 bg-white/35 p-4 overflow-hidden relative">
+					<div className="absolute inset-0 animate-pulse bg-gradient-to-r from-fuchsia-500/10 via-cyan-400/10 to-lime-400/10" />
+					<div className="relative">
+					  <div className="text-sm font-semibold text-slate-900">
+						{jobStatus ? `Search job: ${jobStatus}` : "Searching patents..."}
+					  </div>
+
+					  <div className="text-xs text-slate-700 mt-1">
+						{jobStage || "Ranking results and checking evidence..."}
+					  </div>
+
+					  {jobId && (
+						<div className="mt-1 text-[11px] text-slate-600">
+						  Job ID: {jobId}
+						</div>
+					  )}
+
+					  <div className="mt-3 h-2 w-full rounded-full bg-white/60 overflow-hidden">
+						<div
+						  className="h-full rounded-full bg-gradient-to-r from-fuchsia-600 to-cyan-500 transition-all duration-500"
+						  style={{ width: `${Math.max(0, Math.min(100, jobProgress || 0))}%` }}
+						/>
+					  </div>
+
+					  <div className="mt-2 text-xs text-slate-600">
+						{jobProgress || 0}% complete
+					  </div>
+					</div>
+				  </div>
+				)}
 
               {results.length > 0 && (
                 <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -1933,6 +2743,7 @@ export default function HomePage() {
                       const p = pct(patent.similarity_score);
                       const url = patent.google_patents_url || patentUrl(patent.publication_number);
                       const conf = confidenceLabel(p);
+                      const cpcMeta = getCpcMatchMeta(patent.cpc_alignment_score);
                       const fb = feedback[key] || { vote: null, comment: "", submitted: false, status: "" };
                       const abstract = (patent.abstract_snippet || "").trim();
 
@@ -2082,7 +2893,9 @@ export default function HomePage() {
                                         {(matchedSections || []).length > 0 ? (
                                           <div className="mt-2 flex flex-wrap gap-2">
                                             {matchedSections.map((s) => (
-                                              <Chip key={s} tone="default">{s}</Chip>
+                                              <Chip key={s} tone="default">
+                                                {s}
+                                              </Chip>
                                             ))}
                                           </div>
                                         ) : (
@@ -2126,7 +2939,7 @@ export default function HomePage() {
                               )}
                             </div>
 
-                            <div className="sm:w-44">
+                            <div className="sm:w-52">
                               <p className="text-xs font-medium text-slate-600">Similarity</p>
                               <div className="mt-1 flex items-baseline justify-between">
                                 <p className="text-2xl font-bold text-slate-900">{p}%</p>
@@ -2138,28 +2951,67 @@ export default function HomePage() {
                                   style={{ width: `${p}%` }}
                                 />
                               </div>
+
+                              <div className="mt-3 flex flex-wrap gap-2">
+                                {patent.cpc_alignment_score != null && (
+                                  <span
+                                    className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold ${cpcMeta.tone}`}
+                                    title={`CPC alignment score: ${Number(patent.cpc_alignment_score || 0).toFixed(2)}`}
+                                  >
+                                    {cpcMeta.label}
+                                  </span>
+                                )}
+
+                                {patent.cpc_human && (
+                                  <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-semibold text-slate-700">
+                                    {patent.cpc_human}
+                                  </span>
+                                )}
+                              </div>
+
+                              {patent.cpc_alignment_score != null && (
+                                <div className="mt-2 text-[11px] text-slate-600">
+                                  CPC relevance: {fmtPct01(patent.cpc_alignment_score)}
+                                </div>
+                              )}
                             </div>
                           </div>
 
-                          <div className="mt-4">
-                            <button
-                              type="button"
-                              onClick={() => setOpenWhy((prev) => ({ ...prev, [key]: !prev[key] }))}
-                              className="text-sm font-semibold text-slate-900 hover:text-slate-950"
-                            >
-                              {openWhy[key] ? "Hide" : "Show"} why similar
-                            </button>
-
-                            {openWhy[key] && (patent.why_similar || []).length > 0 && (
-                              <ul className="mt-3 space-y-2 text-sm text-slate-800">
-                                {patent.why_similar.map((line, i) => (
-                                  <li key={i} className="flex gap-2">
-                                    <span className="mt-1 h-2 w-2 rounded-full bg-gradient-to-r from-fuchsia-500 to-cyan-400 flex-shrink-0" />
-                                    <span>{line}</span>
-                                  </li>
-                                ))}
-                              </ul>
+                          <div className="mt-4 space-y-4">
+                            {(patent.rank_explanations || []).length > 0 && (
+                              <div className="rounded-2xl border border-slate-200 bg-slate-50/90 p-4">
+                                <p className="text-sm font-semibold text-slate-900">Why this ranked high</p>
+                                <ul className="mt-2 space-y-2 text-sm text-slate-800">
+                                  {patent.rank_explanations.map((line, i) => (
+                                    <li key={i} className="flex gap-2">
+                                      <span className="mt-1 h-2 w-2 rounded-full bg-slate-400 flex-shrink-0" />
+                                      <span>{line}</span>
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
                             )}
+
+                            <div>
+                              <button
+                                type="button"
+                                onClick={() => setOpenWhy((prev) => ({ ...prev, [key]: !prev[key] }))}
+                                className="text-sm font-semibold text-slate-900 hover:text-slate-950"
+                              >
+                                {openWhy[key] ? "Hide" : "Show"} why similar
+                              </button>
+
+                              {openWhy[key] && (patent.why_similar || []).length > 0 && (
+                                <ul className="mt-3 space-y-2 text-sm text-slate-800">
+                                  {patent.why_similar.map((line, i) => (
+                                    <li key={i} className="flex gap-2">
+                                      <span className="mt-1 h-2 w-2 rounded-full bg-gradient-to-r from-fuchsia-500 to-cyan-400 flex-shrink-0" />
+                                      <span>{line}</span>
+                                    </li>
+                                  ))}
+                                </ul>
+                              )}
+                            </div>
                           </div>
 
                           {(patent.confidence_explanation || []).length > 0 && (
@@ -2258,7 +3110,8 @@ export default function HomePage() {
           </p>
         </section>
       </div>
-	  <Footer />
+
+      <Footer />
     </main>
   );
 }
