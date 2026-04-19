@@ -45,7 +45,8 @@ from crud import (
     admin_recent_searches,
     delete_user_search_history,
 )
-from database import SessionLocal, get_db
+from database import SessionLocal, get_db, Base, engine
+from models import User, SessionToken, UserSearchHistory, SearchLog, FeedbackLog
 from services import run_search_pipeline
 
 
@@ -126,6 +127,8 @@ def init_db() -> None:
 
 app = FastAPI(title="Student Patent Novelty Check - Backend")
 app.include_router(auth_router)
+
+Base.metadata.create_all(bind=engine)
 
 frontend_origin_env = os.getenv("FRONTEND_ORIGIN", "").strip()
 default_origins = [
